@@ -529,14 +529,21 @@ export interface ServerNetwork {
   proxyServerId?: string;
   proxyConfig?: {
     startOrder?: 'proxy_first' | 'backends_first';
-    javaPath?: string;
-    jvmArgs?: string;
+    version?: number;
     bindAddress?: string;
     bindPort?: number;
     publicAddress?: string;
     publicPort?: number;
+    certificatePath?: string;
+    privateKeyPath?: string;
     proxySecret?: string;
+    debugMode?: boolean;
     autoInstallBridge?: boolean;
+    defaultServer?: string;
+    fallbackServer?: string;
+    poolEnabled?: boolean;
+    pool?: Record<string, { strategy?: 'round-robin' | 'random' | 'least-connections'; servers: string[] }>;
+    routes?: { hostname: string; target: string }[];
   };
   color?: string;
   sortOrder: number;
@@ -556,11 +563,26 @@ export interface ServerNetworkMember {
     id: string;
     name: string;
     status: string;
+    version?: string;
   };
 }
 
 export interface NetworkWithMembers extends ServerNetwork {
   members: ServerNetworkMember[];
+  versionAlignment?: {
+    aligned: boolean;
+    updateAvailable: boolean;
+    requiresAttention: boolean;
+    proxyServerId: string | null;
+    proxyVersion: string | null;
+    backendVersions: string[];
+    highestBackendVersion: string | null;
+    canUpdateProxyToSupportServers: boolean;
+    recommendedAction: 'none' | 'update_proxy' | 'align_servers';
+    targetProxyVersion: string | null;
+    targetServerVersion: string | null;
+    reason: string | null;
+  } | null;
 }
 
 export interface NetworkStatus {
@@ -573,6 +595,8 @@ export interface NetworkStatus {
     serverId: string;
     serverName: string;
     status: string;
+    version?: string;
+    bridgeStatus?: 'ok' | 'pending_restart';
     cpuUsage?: number;
     memoryUsage?: number;
     playerCount?: number;
@@ -637,14 +661,21 @@ export interface CreateNetworkDto {
   proxyServerId?: string;
   proxyConfig?: {
     startOrder?: 'proxy_first' | 'backends_first';
-    javaPath?: string;
-    jvmArgs?: string;
+    version?: number;
     bindAddress?: string;
     bindPort?: number;
     publicAddress?: string;
     publicPort?: number;
+    certificatePath?: string;
+    privateKeyPath?: string;
     proxySecret?: string;
+    debugMode?: boolean;
     autoInstallBridge?: boolean;
+    defaultServer?: string;
+    fallbackServer?: string;
+    poolEnabled?: boolean;
+    pool?: Record<string, { strategy?: 'round-robin' | 'random' | 'least-connections'; servers: string[] }>;
+    routes?: { hostname: string; target: string }[];
   };
   color?: string;
   serverIds?: string[];
@@ -656,14 +687,21 @@ export interface UpdateNetworkDto {
   proxyServerId?: string;
   proxyConfig?: {
     startOrder?: 'proxy_first' | 'backends_first';
-    javaPath?: string;
-    jvmArgs?: string;
+    version?: number;
     bindAddress?: string;
     bindPort?: number;
     publicAddress?: string;
     publicPort?: number;
+    certificatePath?: string;
+    privateKeyPath?: string;
     proxySecret?: string;
+    debugMode?: boolean;
     autoInstallBridge?: boolean;
+    defaultServer?: string;
+    fallbackServer?: string;
+    poolEnabled?: boolean;
+    pool?: Record<string, { strategy?: 'round-robin' | 'random' | 'least-connections'; servers: string[] }>;
+    routes?: { hostname: string; target: string }[];
   };
   color?: string;
   sortOrder?: number;

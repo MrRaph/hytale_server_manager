@@ -286,6 +286,10 @@ class ApiService {
     return this.request<T[]>('/api/servers');
   }
 
+  async getConsoleTargets<T = { id: string; name: string; status: string; type: 'server' | 'proxy' }[]>(): Promise<T> {
+    return this.request<T>('/api/servers/console/targets');
+  }
+
   async getServer<T = unknown>(id: string): Promise<T> {
     return this.request<T>(`/api/servers/${id}`);
   }
@@ -1073,14 +1077,21 @@ class ApiService {
     proxyServerId?: string;
     proxyConfig?: {
       startOrder?: 'proxy_first' | 'backends_first';
-      javaPath?: string;
-      jvmArgs?: string;
+      version?: number;
       bindAddress?: string;
       bindPort?: number;
       publicAddress?: string;
       publicPort?: number;
+      certificatePath?: string;
+      privateKeyPath?: string;
       proxySecret?: string;
+      debugMode?: boolean;
       autoInstallBridge?: boolean;
+      defaultServer?: string;
+      fallbackServer?: string;
+      poolEnabled?: boolean;
+      pool?: Record<string, { strategy?: 'round-robin' | 'random' | 'least-connections'; servers: string[] }>;
+      routes?: { hostname: string; target: string }[];
     };
     color?: string;
     serverIds?: string[];
@@ -1097,14 +1108,21 @@ class ApiService {
     proxyServerId?: string;
     proxyConfig?: {
       startOrder?: 'proxy_first' | 'backends_first';
-      javaPath?: string;
-      jvmArgs?: string;
+      version?: number;
       bindAddress?: string;
       bindPort?: number;
       publicAddress?: string;
       publicPort?: number;
+      certificatePath?: string;
+      privateKeyPath?: string;
       proxySecret?: string;
+      debugMode?: boolean;
       autoInstallBridge?: boolean;
+      defaultServer?: string;
+      fallbackServer?: string;
+      poolEnabled?: boolean;
+      pool?: Record<string, { strategy?: 'round-robin' | 'random' | 'least-connections'; servers: string[] }>;
+      routes?: { hostname: string; target: string }[];
     };
     color?: string;
     sortOrder?: number;

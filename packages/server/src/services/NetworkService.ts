@@ -1,4 +1,6 @@
 import { PrismaClient, ServerNetwork as PrismaNetwork } from '@prisma/client';
+import fs from 'fs-extra';
+import path from 'path';
 import { ServerService } from './ServerService';
 import { BackupService } from './BackupService';
 import { ProxyService, ProxyNetworkConfig, ProxyBackendServer } from './ProxyService';
@@ -35,6 +37,23 @@ interface UpdateNetworkDto {
   bulkActionsEnabled?: boolean;
 }
 
+type VersionAlignmentAction = 'none' | 'update_proxy' | 'align_servers';
+
+export interface NetworkVersionAlignment {
+  aligned: boolean;
+  updateAvailable: boolean;
+  requiresAttention: boolean;
+  proxyServerId: string | null;
+  proxyVersion: string | null;
+  backendVersions: string[];
+  highestBackendVersion: string | null;
+  canUpdateProxyToSupportServers: boolean;
+  recommendedAction: VersionAlignmentAction;
+  targetProxyVersion: string | null;
+  targetServerVersion: string | null;
+  reason: string | null;
+}
+
 export class NetworkService {
   private prisma: PrismaClient;
   private serverService: ServerService;
@@ -66,13 +85,26 @@ export class NetworkService {
       throw new Error('A network with this name already exists');
     }
 
+    // Enforce version alignment only for proxy networks
+    if (data.networkType === 'proxy') {
+      if (data.serverIds?.length) {
+        await this.assertUniformVersion(data.serverIds, data.proxyServerId);
+      } else if (data.proxyServerId) {
+        await this.assertUniformVersion([data.proxyServerId], data.proxyServerId);
+      }
+    }
+
+    const normalizedProxyConfig = data.proxyConfig
+      ? this.normalizeProxyConfig(data.proxyConfig)
+      : undefined;
+
     const network = await this.prisma.serverNetwork.create({
       data: {
         name: data.name,
         description: data.description,
         networkType: data.networkType || 'logical',
         proxyServerId: data.proxyServerId,
-        proxyConfig: data.proxyConfig ? JSON.stringify(data.proxyConfig) : null,
+        proxyConfig: normalizedProxyConfig ? JSON.stringify(normalizedProxyConfig) : null,
         color: data.color,
       },
     });
@@ -101,7 +133,7 @@ export class NetworkService {
         members: {
           include: {
             server: {
-              select: { id: true, name: true, status: true },
+              select: { id: true, name: true, status: true, version: true },
             },
           },
           orderBy: { sortOrder: 'asc' },
@@ -109,7 +141,8 @@ export class NetworkService {
       },
     });
 
-    return network as NetworkWithMembers | null;
+    if (!network) return null;
+    return this.withVersionAlignment(network as NetworkWithMembers);
   }
 
   async getAllNetworks(): Promise<NetworkWithMembers[]> {
@@ -118,7 +151,7 @@ export class NetworkService {
         members: {
           include: {
             server: {
-              select: { id: true, name: true, status: true },
+              select: { id: true, name: true, status: true, version: true },
             },
           },
           orderBy: { sortOrder: 'asc' },
@@ -127,7 +160,10 @@ export class NetworkService {
       orderBy: { sortOrder: 'asc' },
     });
 
-    return networks as NetworkWithMembers[];
+    const enriched = await Promise.all(
+      networks.map(network => this.withVersionAlignment(network as NetworkWithMembers))
+    );
+    return enriched as NetworkWithMembers[];
   }
 
   async updateNetwork(networkId: string, data: UpdateNetworkDto): Promise<PrismaNetwork> {
@@ -135,8 +171,20 @@ export class NetworkService {
 
     if (data.name !== undefined) updateData.name = data.name;
     if (data.description !== undefined) updateData.description = data.description;
-    if (data.proxyServerId !== undefined) updateData.proxyServerId = data.proxyServerId;
-    if (data.proxyConfig !== undefined) updateData.proxyConfig = JSON.stringify(data.proxyConfig);
+    if (data.proxyServerId !== undefined) {
+      const existingNetwork = await this.prisma.serverNetwork.findUnique({
+        where: { id: networkId },
+        select: { networkType: true },
+      });
+      if (existingNetwork?.networkType === 'proxy') {
+        await this.assertUniformVersion([], data.proxyServerId, networkId);
+      }
+      updateData.proxyServerId = data.proxyServerId;
+    }
+    if (data.proxyConfig !== undefined) {
+      const normalizedProxyConfig = this.normalizeProxyConfig(data.proxyConfig);
+      updateData.proxyConfig = JSON.stringify(normalizedProxyConfig);
+    }
     if (data.color !== undefined) updateData.color = data.color;
     if (data.sortOrder !== undefined) updateData.sortOrder = data.sortOrder;
     if (data.bulkActionsEnabled !== undefined) updateData.bulkActionsEnabled = data.bulkActionsEnabled;
@@ -145,6 +193,8 @@ export class NetworkService {
       where: { id: networkId },
       data: updateData,
     });
+
+    await this.syncProxyConfigForNetwork(networkId);
 
     logger.info(`Updated network: ${network.name} (${network.id})`);
     return network;
@@ -204,6 +254,19 @@ export class NetworkService {
       sortOrder = (maxSort._max.sortOrder ?? -1) + 1;
     }
 
+    const network = await this.prisma.serverNetwork.findUnique({
+      where: { id: networkId },
+      select: { networkType: true },
+    });
+    if (!network) {
+      throw new Error(`Network ${networkId} not found`);
+    }
+
+    // Enforce version consistency only for proxy networks
+    if (network.networkType === 'proxy') {
+      await this.assertUniformVersion([serverId], undefined, networkId);
+    }
+
     await this.prisma.serverNetworkMember.create({
       data: {
         networkId,
@@ -212,6 +275,8 @@ export class NetworkService {
         sortOrder,
       },
     });
+
+    await this.syncProxyConfigForNetwork(networkId);
 
     logger.info(`Added server ${server.name} to network ${networkId} with role ${role}`);
   }
@@ -242,6 +307,8 @@ export class NetworkService {
       });
     }
 
+    await this.syncProxyConfigForNetwork(networkId);
+
     logger.info(`Removed server ${serverId} from network ${networkId}`);
   }
 
@@ -252,6 +319,8 @@ export class NetworkService {
       },
       data: { role },
     });
+
+    await this.syncProxyConfigForNetwork(networkId);
 
     logger.info(`Updated server ${serverId} role to ${role} in network ${networkId}`);
   }
@@ -265,6 +334,8 @@ export class NetworkService {
         data: { sortOrder: i },
       });
     }
+
+    await this.syncProxyConfigForNetwork(networkId);
 
     logger.info(`Reordered ${serverIds.length} servers in network ${networkId}`);
   }
@@ -282,12 +353,23 @@ export class NetworkService {
     const results: ServerOperationResult[] = [];
 
     if (network.networkType === 'proxy') {
-      const proxyConfig = this.parseProxyConfig(network.proxyConfig);
-      const startOrder = proxyConfig.startOrder || 'backends_first';
       const backendMembers = network.members.filter(m => m.role !== 'proxy');
       const backendServers = await this.loadBackendServers(backendMembers.map(member => member.serverId));
+      this.ensureUniformBackendVersion(backendServers);
+      const backendNames = new Set(backendServers.map(server => server.name));
+      const parsedProxyConfig = this.parseProxyConfig(network.proxyConfig);
+      const prunedProxyConfig = this.pruneProxyConfigForBackends(parsedProxyConfig, backendNames);
+      const validatedProxyConfig = this.normalizeProxyConfig(prunedProxyConfig, backendNames);
+      const effectiveProxyConfig = await this.proxyService.syncProxyConfig(network.id, backendServers, validatedProxyConfig);
+      await this.persistProxyConfig(network.id, effectiveProxyConfig);
+      const startOrder = effectiveProxyConfig.startOrder || 'backends_first';
 
       await this.ensureBackendServerArgs(backendServers);
+      if (effectiveProxyConfig.autoInstallBridge !== false) {
+        await this.bootstrapBackendBridgeConfigs(backendServers);
+        await this.proxyService.syncBridgeForBackends(backendServers, effectiveProxyConfig.proxySecret);
+        await this.verifyBackendSecretConfiguration(backendServers, effectiveProxyConfig.proxySecret);
+      }
 
       if (startOrder === 'backends_first') {
         // Start backends first
@@ -295,10 +377,10 @@ export class NetworkService {
           results.push(await this.startServerSafe(member.serverId, member.server.name));
         }
         // Then start proxy process
-        results.push(await this.startProxySafe(network.id, network.name, backendServers, proxyConfig));
+        results.push(await this.startProxySafe(network.id, network.name, backendServers, effectiveProxyConfig));
       } else {
         // Start proxy first
-        results.push(await this.startProxySafe(network.id, network.name, backendServers, proxyConfig));
+        results.push(await this.startProxySafe(network.id, network.name, backendServers, effectiveProxyConfig));
         // Then start backends
         for (const member of backendMembers) {
           results.push(await this.startServerSafe(member.serverId, member.server.name));
@@ -332,6 +414,8 @@ export class NetworkService {
       const startOrder = proxyConfig.startOrder || 'backends_first';
 
       const backendMembers = network.members.filter(m => m.role !== 'proxy');
+      const backendServers = await this.loadBackendServers(backendMembers.map(member => member.serverId));
+      this.ensureUniformBackendVersion(backendServers);
 
       if (startOrder === 'backends_first') {
         // Stop proxy first (reverse of backends_first start)
@@ -433,16 +517,40 @@ export class NetworkService {
       serverId: string;
       serverName: string;
       status: string;
+      version?: string;
+      bridgeStatus?: 'ok' | 'pending_restart';
       cpuUsage?: number;
       memoryUsage?: number;
       playerCount?: number;
     }[] = [];
+    const proxyConfig = network.networkType === 'proxy' ? this.parseProxyConfig(network.proxyConfig) : {};
+    const expectedProxySecret = proxyConfig.proxySecret?.trim();
+    const memberRuntimeConfigs = network.networkType === 'proxy'
+      ? await this.prisma.server.findMany({
+          where: { id: { in: network.members.map(member => member.serverId) } },
+          select: {
+            id: true,
+            serverPath: true,
+            serverArgs: true,
+          },
+        })
+      : [];
+    const runtimeConfigByServerId = new Map(
+      memberRuntimeConfigs.map((entry) => [entry.id, entry])
+    );
 
     for (const member of network.members) {
       try {
         const status = await this.serverService.getServerStatus(member.serverId);
         let cpuUsage = 0;
         let memoryUsage = 0;
+        const bridgeStatus = network.networkType === 'proxy' && member.role !== 'proxy'
+          ? await this.evaluateBackendBridgeStatus(
+              runtimeConfigByServerId.get(member.serverId),
+              status.status,
+              expectedProxySecret
+            )
+          : undefined;
 
         // Get metrics if server is running
         if (status.status === 'running') {
@@ -459,6 +567,8 @@ export class NetworkService {
           serverId: member.serverId,
           serverName: member.server.name,
           status: status.status,
+          version: member.server.version,
+          bridgeStatus,
           cpuUsage,
           memoryUsage,
           playerCount: status.playerCount,
@@ -468,6 +578,8 @@ export class NetworkService {
           serverId: member.serverId,
           serverName: member.server.name,
           status: 'unknown',
+          version: member.server.version,
+          bridgeStatus: network.networkType === 'proxy' && member.role !== 'proxy' ? 'pending_restart' : undefined,
           cpuUsage: 0,
           memoryUsage: 0,
           playerCount: 0,
@@ -480,6 +592,7 @@ export class NetworkService {
         serverId: `proxy:${networkId}`,
         serverName: `${network.name} Proxy`,
         status: this.proxyService.getStatus(networkId),
+        version: this.proxyService.getRunningProxyVersion(networkId) || undefined,
       });
     }
 
@@ -513,6 +626,74 @@ export class NetworkService {
       stoppedServers: stoppedCount,
       memberStatuses,
     };
+  }
+
+  private hasInsecureAuthMode(serverArgs: string | null | undefined): boolean {
+    const tokens = (serverArgs || '').split(/\s+/).filter(Boolean);
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] !== '--auth-mode') {
+        continue;
+      }
+      return tokens[i + 1] === 'insecure';
+    }
+    return false;
+  }
+
+  private async evaluateBackendBridgeStatus(
+    runtimeConfig: { id: string; serverPath: string; serverArgs: string | null } | undefined,
+    runtimeStatus: string,
+    expectedProxySecret?: string
+  ): Promise<'ok' | 'pending_restart'> {
+    if (!runtimeConfig) {
+      return 'pending_restart';
+    }
+
+    const modsPath = await this.resolveBackendModsPath(runtimeConfig.serverPath);
+    const bridgeConfigPath = path.join(modsPath, 'OrbisProxy_OrbisProxy', 'config.json');
+    const hasAuthArg = this.hasInsecureAuthMode(runtimeConfig.serverArgs);
+
+    let hasBackendMod = false;
+    try {
+      const mods = await fs.readdir(modsPath);
+      hasBackendMod = mods.some((fileName) =>
+        /\.jar$/i.test(fileName) &&
+        (/orbisproxy/i.test(fileName) || /^bridge-/i.test(fileName))
+      );
+    } catch {
+      hasBackendMod = false;
+    }
+
+    let hasMatchingSecret = false;
+    if (await fs.pathExists(bridgeConfigPath)) {
+      try {
+        const bridgeConfig = await fs.readJson(bridgeConfigPath) as { SecretKey?: unknown; Secret?: unknown };
+        const secretKeyValue = typeof bridgeConfig?.SecretKey === 'string' ? bridgeConfig.SecretKey.trim() : '';
+        const secretValue = typeof bridgeConfig?.Secret === 'string' ? bridgeConfig.Secret.trim() : '';
+        const secret = secretKeyValue || secretValue;
+        hasMatchingSecret = expectedProxySecret ? secret === expectedProxySecret : secret.length > 0;
+      } catch {
+        hasMatchingSecret = false;
+      }
+    }
+
+    const ready = hasAuthArg && hasBackendMod && hasMatchingSecret;
+    if (ready) {
+      return 'ok';
+    }
+
+    return runtimeStatus === 'running' ? 'pending_restart' : 'pending_restart';
+  }
+
+  private async resolveBackendModsPath(serverPath: string): Promise<string> {
+    const root = path.resolve(serverPath);
+    const nestedServerRoot = path.join(root, 'Server');
+    if (!(await fs.pathExists(nestedServerRoot))) {
+      throw new Error(
+        `Expected backend runtime folder "${nestedServerRoot}" was not found. ` +
+        'Backends must use servers/<name>/Server layout.'
+      );
+    }
+    return path.join(nestedServerRoot, 'mods');
   }
 
   async getNetworkMetrics(networkId: string): Promise<AggregatedMetrics> {
@@ -737,10 +918,60 @@ export class NetworkService {
     return servers;
   }
 
+  async syncProxyConfigsForServer(serverId: string): Promise<void> {
+    const memberships = await this.prisma.serverNetworkMember.findMany({
+      where: { serverId },
+      select: { networkId: true },
+    });
+
+    for (const membership of memberships) {
+      await this.syncProxyConfigForNetwork(membership.networkId);
+    }
+  }
+
+  /**
+   * Ensure that all servers in a network share the same version.
+   * Throws if a mismatch is detected.
+   */
+  private async assertUniformVersion(newServerIds: string[], proxyServerId?: string, networkId?: string): Promise<string | null> {
+    const ids = new Set<string>(newServerIds);
+    if (proxyServerId) ids.add(proxyServerId);
+
+    if (networkId) {
+      const network = await this.prisma.serverNetwork.findUnique({
+        where: { id: networkId },
+        include: { members: true },
+      });
+      if (network) {
+        network.members.forEach(m => ids.add(m.serverId));
+        if (network.proxyServerId) ids.add(network.proxyServerId);
+      }
+    }
+
+    if (ids.size === 0) return null;
+
+    const servers = await this.prisma.server.findMany({
+      where: { id: { in: Array.from(ids) } },
+      select: { id: true, name: true, version: true },
+    });
+
+    if (servers.length === 0) return null;
+
+    const baseVersion = servers[0].version;
+    const mismatch = servers.find(s => s.version !== baseVersion);
+    if (mismatch) {
+      throw new Error(
+        `Version mismatch in network members: expected ${baseVersion}, found ${mismatch.version} on server ${mismatch.name}`
+      );
+    }
+
+    return baseVersion;
+  }
+
   private parseProxyConfig(proxyConfig: string | null | undefined): ProxyNetworkConfig {
     if (!proxyConfig) return {};
     try {
-      return JSON.parse(proxyConfig) as ProxyNetworkConfig;
+      return this.normalizeProxyConfig(JSON.parse(proxyConfig) as ProxyNetworkConfig);
     } catch {
       return {};
     }
@@ -757,6 +988,7 @@ export class NetworkService {
         address: true,
         port: true,
         serverPath: true,
+        version: true,
       },
     });
 
@@ -766,6 +998,7 @@ export class NetworkService {
       address: server.address,
       port: server.port,
       serverPath: server.serverPath,
+      version: server.version,
     }));
   }
 
@@ -778,20 +1011,511 @@ export class NetworkService {
       if (!dbServer) continue;
 
       const currentArgs = (dbServer.serverArgs || '').trim();
-      const requiredFlags = ['--accept-early-plugins', '--auth-mode', 'insecure'];
-      const hasAllFlags = requiredFlags.every(flag => currentArgs.includes(flag));
-      if (hasAllFlags) continue;
+      const tokens = currentArgs.length > 0 ? currentArgs.split(/\s+/).filter(Boolean) : [];
+      const normalizedTokens: string[] = [];
 
-      const mergedArgs = [currentArgs, '--accept-early-plugins --auth-mode insecure']
-        .filter(Boolean)
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+      // Remove any existing --auth-mode value so we can enforce exactly one value.
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token === '--auth-mode') {
+          i += 1; // Skip existing value token as well
+          continue;
+        }
+        normalizedTokens.push(token);
+      }
+
+      normalizedTokens.push('--auth-mode', 'insecure');
+      const mergedArgs = normalizedTokens.join(' ').replace(/\s+/g, ' ').trim();
+
+      if (mergedArgs === currentArgs) {
+        continue;
+      }
 
       await this.prisma.server.update({
         where: { id: server.id },
         data: { serverArgs: mergedArgs },
       });
     }
+  }
+
+  private async bootstrapBackendBridgeConfigs(backendServers: ProxyBackendServer[]): Promise<void> {
+    for (const server of backendServers) {
+      const modsPath = await this.resolveBackendModsPath(server.serverPath);
+      const bridgeConfigPath = path.join(modsPath, 'OrbisProxy_OrbisProxy', 'config.json');
+      if (await fs.pathExists(bridgeConfigPath)) {
+        continue;
+      }
+
+      const dbServer = await this.prisma.server.findUnique({
+        where: { id: server.id },
+        select: { status: true, name: true },
+      });
+
+      if (!dbServer) {
+        continue;
+      }
+
+      if (dbServer.status !== 'stopped') {
+        logger.warn(
+          `[NetworkService] Bridge bootstrap skipped for backend ${dbServer.name}: server is ${dbServer.status} and ${bridgeConfigPath} does not exist yet.`
+        );
+        continue;
+      }
+
+      logger.info(
+        `[NetworkService] Bootstrapping backend mod files for ${dbServer.name} (start once / stop once).`
+      );
+
+      let started = false;
+      try {
+        await this.serverService.startServer(server.id);
+        started = true;
+        await this.waitForFile(bridgeConfigPath, 15000, 500);
+      } catch (error) {
+        logger.warn(
+          `[NetworkService] Backend bootstrap failed for ${dbServer.name}; continuing with managed bridge config write.`,
+          error
+        );
+      } finally {
+        if (started) {
+          try {
+            await this.serverService.stopServer(server.id);
+          } catch (stopError) {
+            logger.warn(
+              `[NetworkService] Failed to stop backend ${dbServer.name} after bridge bootstrap.`,
+              stopError
+            );
+          }
+        }
+      }
+    }
+  }
+
+  private async waitForFile(filePath: string, timeoutMs: number, intervalMs: number): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (await fs.pathExists(filePath)) {
+        return true;
+      }
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    return false;
+  }
+
+  private async verifyBackendSecretConfiguration(
+    backendServers: ProxyBackendServer[],
+    expectedSecret: string
+  ): Promise<void> {
+    for (const server of backendServers) {
+      const modsPath = await this.resolveBackendModsPath(server.serverPath);
+      const bridgeConfigPath = path.join(modsPath, 'OrbisProxy_OrbisProxy', 'config.json');
+      if (!(await fs.pathExists(bridgeConfigPath))) {
+        throw new Error(`Backend ${server.name} is missing OrbisProxy config at ${bridgeConfigPath}`);
+      }
+
+      let bridgeConfig: { SecretKey?: unknown; Secret?: unknown };
+      try {
+        bridgeConfig = await fs.readJson(bridgeConfigPath) as { SecretKey?: unknown; Secret?: unknown };
+      } catch {
+        throw new Error(`Backend ${server.name} has an invalid OrbisProxy config file: ${bridgeConfigPath}`);
+      }
+
+      const secretKeyValue = typeof bridgeConfig.SecretKey === 'string' ? bridgeConfig.SecretKey.trim() : '';
+      const secretValue = typeof bridgeConfig.Secret === 'string' ? bridgeConfig.Secret.trim() : '';
+      const actualSecret = secretKeyValue || secretValue;
+      if (actualSecret !== expectedSecret) {
+        throw new Error(`Backend ${server.name} Secret mismatch in ${bridgeConfigPath}`);
+      }
+    }
+  }
+
+  private ensureUniformBackendVersion(backendServers: ProxyBackendServer[]): string | undefined {
+    if (backendServers.length === 0) return undefined;
+    const baseVersion = backendServers[0].version;
+    const mismatch = backendServers.find(server => server.version !== baseVersion);
+    if (mismatch) {
+      throw new Error(
+        `Version mismatch in backend servers: expected ${baseVersion}, found ${mismatch.version} on server ${mismatch.name}`
+      );
+    }
+    return baseVersion;
+  }
+
+  private async syncProxyConfigForNetwork(networkId: string): Promise<void> {
+    const network = await this.prisma.serverNetwork.findUnique({
+      where: { id: networkId },
+      include: {
+        members: {
+          orderBy: { sortOrder: 'asc' },
+        },
+      },
+    });
+
+    if (!network || network.networkType !== 'proxy') {
+      return;
+    }
+
+    const proxyConfig = this.parseProxyConfig(network.proxyConfig);
+    const backendMembers = network.members.filter(member => member.role !== 'proxy');
+    const backendServers = await this.loadBackendServers(backendMembers.map(member => member.serverId));
+    await this.ensureBackendServerArgs(backendServers);
+    const backendNames = new Set(backendServers.map(server => server.name));
+    const prunedProxyConfig = this.pruneProxyConfigForBackends(proxyConfig, backendNames);
+    const validatedProxyConfig = this.normalizeProxyConfig(prunedProxyConfig, backendNames);
+    await this.reconcileProxyServerVersion(network.id, network.proxyServerId, backendServers);
+
+    const effectiveConfig = await this.proxyService.syncProxyConfig(network.id, backendServers, validatedProxyConfig);
+    await this.persistProxyConfig(network.id, effectiveConfig);
+
+    if (effectiveConfig.autoInstallBridge !== false) {
+      await this.proxyService.syncBridgeForBackends(backendServers, effectiveConfig.proxySecret);
+      await this.verifyBackendSecretConfiguration(backendServers, effectiveConfig.proxySecret);
+    }
+
+    try {
+      await this.proxyService.restartIfProxyVersionChanged(
+        network.id,
+        network.name,
+        backendServers,
+        effectiveConfig
+      );
+    } catch (error) {
+      logger.warn(`[NetworkService] Failed to restart proxy after version change for network ${network.id}:`, error);
+    }
+  }
+
+  private async persistProxyConfig(networkId: string, config: ProxyNetworkConfig): Promise<void> {
+    await this.prisma.serverNetwork.update({
+      where: { id: networkId },
+      data: { proxyConfig: JSON.stringify(config) },
+    });
+  }
+
+  private pruneProxyConfigForBackends(
+    config: ProxyNetworkConfig,
+    backendNames: Set<string>
+  ): ProxyNetworkConfig {
+    const next: ProxyNetworkConfig = { ...config };
+
+    if (next.defaultServer && !backendNames.has(next.defaultServer)) {
+      next.defaultServer = undefined;
+    }
+    if (next.fallbackServer && !backendNames.has(next.fallbackServer)) {
+      next.fallbackServer = undefined;
+    }
+
+    const nextPool: NonNullable<ProxyNetworkConfig['pool']> = {};
+    for (const [poolName, poolConfig] of Object.entries(next.pool || {})) {
+      const servers = (poolConfig?.servers || []).filter(server => backendNames.has(server));
+      if (servers.length === 0) {
+        continue;
+      }
+      nextPool[poolName] = {
+        strategy: poolConfig?.strategy,
+        servers,
+      };
+    }
+    next.pool = nextPool;
+
+    const poolNames = new Set(Object.keys(nextPool));
+    next.routes = (next.routes || []).filter(route =>
+      backendNames.has(route.target) || poolNames.has(route.target)
+    );
+
+    return next;
+  }
+
+  private async withVersionAlignment(network: NetworkWithMembers): Promise<NetworkWithMembers & { versionAlignment: NetworkVersionAlignment | null }> {
+    if (network.networkType !== 'proxy') {
+      return { ...network, versionAlignment: null };
+    }
+
+    const backendMembers = network.members.filter(member => member.role !== 'proxy');
+    const backendVersions = Array.from(new Set(
+      backendMembers
+        .map(member => member.server.version)
+        .filter((version): version is string => Boolean(version))
+    ));
+
+    const highestBackendVersion = backendVersions.reduce<string | null>((current, version) => {
+      if (!current) return version;
+      return this.compareVersions(version, current) > 0 ? version : current;
+    }, null);
+
+    const proxyServerId = network.proxyServerId || null;
+    const proxyVersion = proxyServerId
+      ? (
+        await this.prisma.server.findUnique({
+          where: { id: proxyServerId },
+          select: { version: true },
+        })
+      )?.version || null
+      : null;
+
+    const hasMismatch = Boolean(
+      proxyVersion &&
+      backendVersions.length > 0 &&
+      backendVersions.some(version => version !== proxyVersion)
+    );
+
+    let canUpdateProxyToSupportServers = false;
+    if (hasMismatch && highestBackendVersion && highestBackendVersion !== proxyVersion) {
+      canUpdateProxyToSupportServers = await this.proxyService.canSupportVersion(highestBackendVersion);
+    }
+
+    let recommendedAction: VersionAlignmentAction = 'none';
+    let targetProxyVersion: string | null = null;
+    let targetServerVersion: string | null = null;
+    let reason: string | null = null;
+
+    if (hasMismatch) {
+      if (canUpdateProxyToSupportServers && highestBackendVersion) {
+        recommendedAction = 'update_proxy';
+        targetProxyVersion = highestBackendVersion;
+        reason = `Proxy version ${proxyVersion} does not match backend version ${highestBackendVersion}. A compatible proxy release exists.`;
+      } else {
+        recommendedAction = 'align_servers';
+        targetServerVersion = proxyVersion;
+        reason = `Proxy version ${proxyVersion} does not match backend versions (${backendVersions.join(', ')}). Use proxy-compatible server versions.`;
+      }
+    }
+
+    return {
+      ...network,
+      versionAlignment: {
+        aligned: !hasMismatch,
+        updateAvailable: hasMismatch,
+        requiresAttention: hasMismatch,
+        proxyServerId,
+        proxyVersion,
+        backendVersions,
+        highestBackendVersion,
+        canUpdateProxyToSupportServers,
+        recommendedAction,
+        targetProxyVersion,
+        targetServerVersion,
+        reason,
+      },
+    };
+  }
+
+  private compareVersions(a: string, b: string): number {
+    const normalize = (v: string) => v.replace(/^v/i, '');
+    const toParts = (v: string) => normalize(v)
+      .split('.')
+      .map(part => {
+        const n = Number.parseInt(part, 10);
+        return Number.isNaN(n) ? 0 : n;
+      });
+
+    const aParts = toParts(a);
+    const bParts = toParts(b);
+    const length = Math.max(aParts.length, bParts.length);
+
+    for (let i = 0; i < length; i++) {
+      const av = aParts[i] ?? 0;
+      const bv = bParts[i] ?? 0;
+      if (av > bv) return 1;
+      if (av < bv) return -1;
+    }
+    return 0;
+  }
+
+  private async reconcileProxyServerVersion(
+    networkId: string,
+    proxyServerId: string | null,
+    backendServers: ProxyBackendServer[]
+  ): Promise<void> {
+    if (!proxyServerId || backendServers.length === 0) {
+      return;
+    }
+
+    const highestBackendVersion = backendServers
+      .map(server => server.version)
+      .filter((version): version is string => Boolean(version))
+      .reduce<string | null>((current, version) => {
+        if (!current) return version;
+        return this.compareVersions(version, current) > 0 ? version : current;
+      }, null);
+
+    if (!highestBackendVersion) {
+      return;
+    }
+
+    const proxyServer = await this.prisma.server.findUnique({
+      where: { id: proxyServerId },
+      select: { id: true, version: true, name: true },
+    });
+
+    if (!proxyServer || proxyServer.version === highestBackendVersion) {
+      return;
+    }
+
+    const canUpdateProxy = await this.proxyService.canSupportVersion(highestBackendVersion);
+    if (!canUpdateProxy) {
+      logger.warn(
+        `[NetworkService] Proxy ${proxyServer.name} (${networkId}) cannot be aligned to backend version ${highestBackendVersion} (release not found).`
+      );
+      return;
+    }
+
+    await this.prisma.server.update({
+      where: { id: proxyServer.id },
+      data: { version: highestBackendVersion },
+    });
+
+    logger.info(
+      `[NetworkService] Aligned proxy server ${proxyServer.name} version from ${proxyServer.version} to ${highestBackendVersion} for network ${networkId}.`
+    );
+  }
+
+  private normalizeProxyConfig(
+    raw: ProxyNetworkConfig | undefined,
+    backendNames?: Set<string>
+  ): ProxyNetworkConfig {
+    if (!raw) return {};
+
+    const normalized: ProxyNetworkConfig = {};
+
+    const trimOptionalString = (value: unknown, field: string): string | undefined => {
+      if (value === undefined || value === null) return undefined;
+      if (typeof value !== 'string') {
+        throw new Error(`Invalid proxy config: ${field} must be a string`);
+      }
+      const trimmed = value.trim();
+      if (trimmed === 'undefined' || trimmed === 'null') {
+        return undefined;
+      }
+      return trimmed.length > 0 ? trimmed : undefined;
+    };
+
+    const optionalPort = (value: unknown, field: string): number | undefined => {
+      if (value === undefined || value === null || value === '') return undefined;
+      const parsed = typeof value === 'number' ? value : Number(value);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        throw new Error(`Invalid proxy config: ${field} must be an integer between 1 and 65535`);
+      }
+      return parsed;
+    };
+
+    if (raw.startOrder !== undefined) {
+      if (raw.startOrder !== 'backends_first' && raw.startOrder !== 'proxy_first') {
+        throw new Error('Invalid proxy config: startOrder must be "backends_first" or "proxy_first"');
+      }
+      normalized.startOrder = raw.startOrder;
+    }
+
+    if (raw.version !== undefined) {
+      if (!Number.isInteger(raw.version) || raw.version < 1) {
+        throw new Error('Invalid proxy config: version must be a positive integer');
+      }
+      normalized.version = raw.version;
+    }
+
+    normalized.bindAddress = trimOptionalString(raw.bindAddress, 'bindAddress');
+    normalized.bindPort = optionalPort(raw.bindPort, 'bindPort');
+    normalized.publicAddress = trimOptionalString(raw.publicAddress, 'publicAddress');
+    normalized.publicPort = optionalPort(raw.publicPort, 'publicPort');
+    normalized.certificatePath = trimOptionalString(raw.certificatePath, 'certificatePath');
+    normalized.privateKeyPath = trimOptionalString(raw.privateKeyPath, 'privateKeyPath');
+    normalized.proxySecret = trimOptionalString(raw.proxySecret, 'proxySecret');
+
+    if (raw.debugMode !== undefined) {
+      if (typeof raw.debugMode !== 'boolean') {
+        throw new Error('Invalid proxy config: debugMode must be a boolean');
+      }
+      normalized.debugMode = raw.debugMode;
+    }
+
+    if (raw.autoInstallBridge !== undefined) {
+      if (typeof raw.autoInstallBridge !== 'boolean') {
+        throw new Error('Invalid proxy config: autoInstallBridge must be a boolean');
+      }
+      normalized.autoInstallBridge = raw.autoInstallBridge;
+    }
+
+    normalized.defaultServer = trimOptionalString(raw.defaultServer, 'defaultServer');
+    normalized.fallbackServer = trimOptionalString(raw.fallbackServer, 'fallbackServer');
+
+    if (raw.poolEnabled !== undefined) {
+      if (typeof raw.poolEnabled !== 'boolean') {
+        throw new Error('Invalid proxy config: poolEnabled must be a boolean');
+      }
+      normalized.poolEnabled = raw.poolEnabled;
+    }
+
+    if (raw.pool !== undefined) {
+      if (!raw.pool || typeof raw.pool !== 'object' || Array.isArray(raw.pool)) {
+        throw new Error('Invalid proxy config: pool must be an object');
+      }
+      const normalizedPool: Record<string, { strategy?: 'round-robin' | 'random' | 'least-connections'; servers: string[] }> = {};
+      for (const [poolName, poolConfig] of Object.entries(raw.pool)) {
+        const name = poolName.trim();
+        if (!name) {
+          throw new Error('Invalid proxy config: pool names must be non-empty');
+        }
+        if (!poolConfig || typeof poolConfig !== 'object' || Array.isArray(poolConfig)) {
+          throw new Error(`Invalid proxy config: pool.${name} must be an object`);
+        }
+        const strategy = (poolConfig as any).strategy;
+        if (strategy !== undefined && !['round-robin', 'random', 'least-connections'].includes(strategy)) {
+          throw new Error(`Invalid proxy config: pool.${name}.strategy is invalid`);
+        }
+        const servers = (poolConfig as any).servers;
+        if (!Array.isArray(servers) || servers.some(value => typeof value !== 'string' || value.trim().length === 0)) {
+          throw new Error(`Invalid proxy config: pool.${name}.servers must be an array of non-empty strings`);
+        }
+        normalizedPool[name] = {
+          strategy: strategy as 'round-robin' | 'random' | 'least-connections' | undefined,
+          servers: servers.map((serverName: string) => serverName.trim()),
+        };
+      }
+      normalized.pool = normalizedPool;
+    }
+
+    if (raw.routes !== undefined) {
+      if (!Array.isArray(raw.routes)) {
+        throw new Error('Invalid proxy config: routes must be an array');
+      }
+      normalized.routes = raw.routes.map((route, index) => {
+        if (!route || typeof route !== 'object') {
+          throw new Error(`Invalid proxy config: routes[${index}] must be an object`);
+        }
+        const hostname = trimOptionalString((route as any).hostname, `routes[${index}].hostname`);
+        const target = trimOptionalString((route as any).target, `routes[${index}].target`);
+        if (!hostname || !target) {
+          throw new Error(`Invalid proxy config: routes[${index}] requires hostname and target`);
+        }
+        return { hostname, target };
+      });
+    }
+
+    if (backendNames && backendNames.size > 0) {
+      if (normalized.defaultServer && !backendNames.has(normalized.defaultServer)) {
+        throw new Error(`Invalid proxy config: defaultServer "${normalized.defaultServer}" is not a backend member`);
+      }
+      if (normalized.fallbackServer && !backendNames.has(normalized.fallbackServer)) {
+        throw new Error(`Invalid proxy config: fallbackServer "${normalized.fallbackServer}" is not a backend member`);
+      }
+      if (normalized.pool) {
+        for (const [poolName, poolConfig] of Object.entries(normalized.pool)) {
+          for (const serverName of poolConfig.servers) {
+            if (!backendNames.has(serverName)) {
+              throw new Error(`Invalid proxy config: pool "${poolName}" references unknown backend "${serverName}"`);
+            }
+          }
+        }
+      }
+      if (normalized.routes) {
+        const poolNames = new Set(Object.keys(normalized.pool || {}));
+        for (const route of normalized.routes) {
+          if (!backendNames.has(route.target) && !poolNames.has(route.target)) {
+            throw new Error(`Invalid proxy config: route target "${route.target}" is neither a backend server nor a pool`);
+          }
+        }
+      }
+    }
+
+    return normalized;
   }
 }

@@ -11,8 +11,8 @@ services:
     container_name: hytale-server-manager-dev
     restart: unless-stopped
     ports:
-      - "3001:3001/tcp"
-      - "5520:5520/udp"
+      - "127.0.0.1:3001:3001/tcp"
+      - "127.0.0.1:5520:5520/udp"
     environment:
       # User/Group ID for file permissions (use `id` command to find yours)
       - PUID=1000
@@ -41,6 +41,7 @@ services:
       - hsm-dev-database:/app/data/db
       # Game server files
       - hsm-dev-servers:/app/servers
+      - hsm-dev-proxies:/app/proxies
       # Backup storage
       - hsm-dev-backups:/app/data/backups
       # Application logs
@@ -61,6 +62,7 @@ services:
 volumes:
   hsm-dev-database:
   hsm-dev-servers:
+  hsm-dev-proxies:
   hsm-dev-backups:
   hsm-dev-logs:
   hsm-dev-certs:

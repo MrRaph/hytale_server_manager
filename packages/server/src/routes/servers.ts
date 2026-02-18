@@ -12,6 +12,8 @@ import { WorldsService } from '../services/WorldsService';
 import { AlertsService } from '../services/AlertsService';
 import { AutomationRulesService } from '../services/AutomationRulesService';
 import { ModProviderService } from '../services/ModProviderService';
+import { NetworkService } from '../services/NetworkService';
+import { ProxyService } from '../services/ProxyService';
 import { requirePermission, AuthenticatedRequest } from '../middleware/auth';
 import { PERMISSIONS } from '../permissions/definitions';
 import { ActivityLogService } from '../services/ActivityLogService';
@@ -31,7 +33,9 @@ export function createServerRoutes(
   worldsService: WorldsService,
   alertsService: AlertsService,
   automationRulesService: AutomationRulesService,
-  modProviderService?: ModProviderService  // Optional for backward compatibility during transition
+  modProviderService: ModProviderService | undefined,  // Optional for backward compatibility during transition
+  networkService: NetworkService,
+  proxyService: ProxyService
 ): Router {
   const router = Router();
 
@@ -50,6 +54,38 @@ export function createServerRoutes(
     } catch (error) {
       logger.error('Error getting servers:', error);
       res.status(500).json({ error: 'Failed to get servers' });
+    }
+  });
+
+  /**
+   * GET /api/servers/console/targets
+   * List console targets (servers + proxy networks)
+   */
+  router.get('/console/targets', requirePermission(PERMISSIONS.SERVERS_CONSOLE), async (_req: Request, res: Response) => {
+    try {
+      const servers = await serverService.getAllServers();
+
+      const proxyNetworks = await networkService.getAllNetworks();
+      const proxyTargets = proxyNetworks
+        .filter(n => n.networkType === 'proxy')
+        .map(n => ({
+          id: `proxy:${n.id}`,
+          name: `${n.name} Proxy`,
+          status: proxyService.getStatus(n.id),
+          type: 'proxy' as const,
+        }));
+
+      const serverTargets = servers.map(s => ({
+        id: s.id,
+        name: s.name,
+        status: s.status,
+        type: 'server' as const,
+      }));
+
+      res.json([...serverTargets, ...proxyTargets]);
+    } catch (error) {
+      logger.error('Error getting console targets:', error);
+      res.status(500).json({ error: 'Failed to get console targets' });
     }
   });
 
@@ -151,6 +187,9 @@ export function createServerRoutes(
   router.patch('/:id', requirePermission(PERMISSIONS.SERVERS_UPDATE), async (req: Request, res: Response) => {
     try {
       const server = await serverService.updateServer(req.params.id, req.body);
+      // Keep proxy network config.yml + bridge state in sync for any server update.
+      await networkService.syncProxyConfigsForServer(req.params.id);
+
       res.json(server);
     } catch (error) {
       logger.error('Error updating server:', error);

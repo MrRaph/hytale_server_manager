@@ -11,6 +11,7 @@ import {
   HardDrive,
   Settings,
   Trash2,
+  ArrowUp,
 } from 'lucide-react';
 import { Card, Button, Badge } from '../ui';
 import { NetworkServerRow } from './NetworkServerRow';
@@ -129,15 +130,29 @@ export const NetworkCard = ({
 
             {/* Network Info */}
             <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h3 className="font-heading font-bold text-text-light-primary dark:text-text-primary truncate">
-                  {network.name}
-                </h3>
-                <Badge variant={network.networkType === 'proxy' ? 'info' : 'default'} size="sm">
-                  {network.networkType}
-                </Badge>
-                {getStatusBadge()}
-              </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="font-heading font-bold text-text-light-primary dark:text-text-primary truncate">
+                {network.name}
+              </h3>
+              <Badge variant={network.networkType === 'proxy' ? 'info' : 'default'} size="sm">
+                {network.networkType}
+              </Badge>
+              {getStatusBadge()}
+              {network.networkType === 'proxy' && network.versionAlignment?.updateAvailable && (
+                <button
+                  type="button"
+                  className="flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-white bg-accent-primary rounded-full hover:bg-accent-primary/80 transition-colors"
+                  title={network.versionAlignment.reason || 'Proxy/server versions are not aligned'}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onManageServers(network);
+                  }}
+                >
+                  <ArrowUp className="w-3 h-3" />
+                  Update
+                </button>
+              )}
+            </div>
               <p className="text-sm text-text-light-muted dark:text-text-muted mt-1">
                 {t('networks.card.member_count', {
                   count: network.members.length
